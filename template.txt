@@ -1,0 +1,636 @@
+modmain.lua
+============================
+local Ingredient = GLOBAL.Ingredient
+local RECIPETABS = GLOBAL.RECIPETABS
+local Recipe = GLOBAL.Recipe
+local TECH = GLOBAL.TECH
+local STRINGS = GLOBAL.STRINGS
+local ACTIONS = GLOBAL.ACTIONS
+local EQUIPSLOTS = GLOBAL.EQUIPSLOTS
+local KEY_G = GLOBAL.KEY_G
+local KEY_T = GLOBAL.KEY_T
+local TheInput = GLOBAL.TheInput
+local MOD_RPC = GLOBAL.MOD_RPC
+local SendModRPCToServer = GLOBAL.SendModRPCToServer
+local TheFrontEnd = GLOBAL.TheFrontEnd
+
+
+PrefabFiles = 
+{
+    "dream",
+}
+
+Assets = 
+{
+    Asset("ATLAS", "images/inventoryimages/dream.xml"),
+    Asset("IMAGE", "images/inventoryimages/dream.tex"),
+}
+
+TUNING.DREAM_DAMAGE = GetModConfigData("dream_damage") or 50
+TUNING.DREAM_ATTACK_PERIOD = GetModConfigData("dream_attack_period") or 0.5
+TUNING.DREAM_CRIT_CHANCE = GetModConfigData("dream_crit_chance") or 0.25  -- 25% crit chance
+TUNING.DREAM_CRIT_MULTIPLIER = GetModConfigData("dream_crit_multiplier") or 1.5  -- 1.5x damage on crit
+TUNING.DREAM_PROJECTILE_CHANCE = GetModConfigData("dream_projectile_chance") or 0.3  -- 30% chance per hit
+
+if GetModConfigData("dream_recipe") ~= 2 then
+    dream_recipe = AddRecipe2("dream",	{Ingredient("twigs",1)},
+    TECH.NONE,
+    {numtogive = 1, atlas = "images/inventoryimages/dream.xml", image = "dream.tex",}, {"WEAPONS"} )
+end
+
+local containers = GLOBAL.require("containers")
+local params = containers.params
+
+params.dream =
+{
+    widget =
+    {
+        slotpos = {},
+        animbank = "ui_chest_3x3",
+        animbuild = "ui_chest_3x3",
+        pos = GLOBAL.Vector3(360, 0, 0),
+        side_align_tip = 160,
+    },
+    type = "chest",
+    issidewidget = false,
+    openlimit = 1,
+}
+
+-- Item containers hit a network slot limit above 20; keep this at 2x10 to avoid load-time crashes.
+for y = 9, 0, -1 do
+    for x = 0, 1 do
+        table.insert(params.dream.widget.slotpos, GLOBAL.Vector3(64 * x - 32, 64 * y - 288, 0))
+    end
+end
+
+-- Widget hook disabled - container works fine without cosmetic customization
+-- The hook was causing crashes. Container UI renders correctly with default chest appearance.
+--[[
+if GLOBAL.TheNet ~= nil and not GLOBAL.TheNet:IsDedicated() and GLOBAL.AddClassPostConstruct ~= nil then
+    GLOBAL.AddClassPostConstruct("widgets/containerwidget", function(self)
+        -- ...hook code...
+    end)
+end
+--]]
+
+local function FindDreamItem(player)
+    if player == nil or player.components == nil or player.components.inventory == nil then
+        return nil
+    end
+
+    local inv = player.components.inventory
+    local hand_item = inv:GetEquippedItem(EQUIPSLOTS.HANDS)
+    if hand_item ~= nil and hand_item.prefab == "dream" then
+        return hand_item
+    end
+
+    for _, item in pairs(inv.itemslots) do
+        if item ~= nil and item.prefab == "dream" then
+            return item
+        end
+    end
+
+    return nil
+end
+
+local function FindEquippedDreamItem(player)
+    if player == nil or player.components == nil or player.components.inventory == nil then
+        return nil
+    end
+
+    local hand_item = player.components.inventory:GetEquippedItem(EQUIPSLOTS.HANDS)
+    return hand_item ~= nil and hand_item.prefab == "dream" and hand_item or nil
+end
+
+local DREAM_AUTO_PICKUP_RADIUS = 4
+local DREAM_AUTO_PICKUP_INTERVAL = 0.25
+local DREAM_STAR_MAX_DISTANCE = 30
+local DREAM_PAN_FLUTE_RANGE = 15
+local DREAM_PAN_FLUTE_DURATION = 20
+local DREAM_AUTO_PICKUP_MUST_TAGS = { "_inventoryitem" }
+local DREAM_AUTO_PICKUP_CANT_TAGS = { "INLIMBO", "NOCLICK", "catchable", "fire", "minesprung" }
+
+local function CanDreamAutoPickupItem(item)
+    if item == nil or not item:IsValid() or item.components == nil or item.components.inventoryitem == nil then
+        return false
+    end
+
+    local inventoryitem = item.components.inventoryitem
+    if not inventoryitem.canbepickedup then
+        return false
+    end
+
+    return inventoryitem.IsHeld == nil or not inventoryitem:IsHeld()
+end
+
+local function GiveItemToDream(player, dream_item, item)
+    local position = item:GetPosition()
+    if player.components.inventory ~= nil then
+        return player.components.inventory:GiveItem(item, nil, position, true)
+    end
+
+    return false
+end
+
+local StopDreamAutoPickup
+
+local function DreamAutoPickupTick(player)
+    if player == nil or not player:IsValid() or player.components == nil or player.components.inventory == nil then
+        return
+    end
+
+    local dream_item = FindEquippedDreamItem(player)
+    if dream_item == nil then
+        StopDreamAutoPickup(player)
+        return
+    end
+
+    local x, y, z = player.Transform:GetWorldPosition()
+    local items = GLOBAL.TheSim:FindEntities(x, y, z, DREAM_AUTO_PICKUP_RADIUS, DREAM_AUTO_PICKUP_MUST_TAGS, DREAM_AUTO_PICKUP_CANT_TAGS)
+    for _, item in ipairs(items) do
+        if CanDreamAutoPickupItem(item) then
+            if GiveItemToDream(player, dream_item, item) then
+                break
+            end
+        end
+    end
+end
+
+StopDreamAutoPickup = function(player)
+    if player._dream_auto_pickup_task ~= nil then
+        player._dream_auto_pickup_task:Cancel()
+        player._dream_auto_pickup_task = nil
+    end
+    player._dream_auto_pickup_enabled = nil
+end
+
+local function StartDreamAutoPickup(player)
+    StopDreamAutoPickup(player)
+    player._dream_auto_pickup_enabled = true
+    player._dream_auto_pickup_task = player:DoPeriodicTask(DREAM_AUTO_PICKUP_INTERVAL, DreamAutoPickupTick)
+    DreamAutoPickupTick(player)
+end
+
+local function ToggleDreamAutoPickup(player)
+    if FindEquippedDreamItem(player) == nil then
+        return
+    end
+
+    if player._dream_auto_pickup_enabled then
+        StopDreamAutoPickup(player)
+    else
+        StartDreamAutoPickup(player)
+    end
+
+    if player.components.talker ~= nil then
+        player.components.talker:Say(player._dream_auto_pickup_enabled and "Dream auto pickup: ON" or "Dream auto pickup: OFF")
+    end
+end
+
+local function CallDreamStar(player, x, z)
+    if FindEquippedDreamItem(player) == nil then
+        return
+    end
+
+    local px, py, pz = player.Transform:GetWorldPosition()
+    if type(x) ~= "number" or type(z) ~= "number" then
+        x, z = px, pz
+    end
+
+    local dx = x - px
+    local dz = z - pz
+    if dx * dx + dz * dz > DREAM_STAR_MAX_DISTANCE * DREAM_STAR_MAX_DISTANCE then
+        x, z = px, pz
+    end
+
+    if GLOBAL.TheWorld.Map ~= nil and not GLOBAL.TheWorld.Map:IsPassableAtPoint(x, py, z) then
+        x, z = px, pz
+    end
+
+    local star = GLOBAL.SpawnPrefab("stafflight")
+    if star ~= nil then
+        star.Transform:SetPosition(x, 0, z)
+    end
+end
+
+local function PlayDreamPanFlute(player)
+    if FindEquippedDreamItem(player) == nil then
+        return
+    end
+
+    local px, py, pz = player.Transform:GetWorldPosition()
+
+    local targets = GLOBAL.TheSim:FindEntities(
+        px,
+        py,
+        pz,
+        DREAM_PAN_FLUTE_RANGE,
+        { "_combat" },
+        { "INLIMBO", "player", "playerghost", "wall", "structure", "epic" }
+    )
+
+    for _, target in ipairs(targets) do
+        if target ~= player
+            and target.components ~= nil
+            and target.components.sleeper ~= nil
+            and target.components.sleeper:IsAsleep() == false then
+            target.components.sleeper:GoToSleep(DREAM_PAN_FLUTE_DURATION)
+        end
+    end
+
+    if player.SoundEmitter ~= nil then
+        player.SoundEmitter:PlaySound("dontstarve/common/pan_flute")
+    end
+
+    if player.components.talker ~= nil then
+        player.components.talker:Say("Pan Flute")
+    end
+end
+
+AddModRPCHandler(modname, "TOGGLE_DREAM_CONTAINER", function(player)
+    local item = FindDreamItem(player)
+    if item == nil or item.components == nil or item.components.container == nil then
+        return
+    end
+
+    if item.components.container:IsOpenedBy(player) then
+        item.components.container:Close(player)
+    else
+        item.components.container:Open(player)
+    end
+end)
+
+AddModRPCHandler(modname, "TOGGLE_DREAM_AUTO_PICKUP", function(player)
+    ToggleDreamAutoPickup(player)
+end)
+
+AddModRPCHandler(modname, "CALL_DREAM_STAR", function(player, x, z)
+    CallDreamStar(player, x, z)
+end)
+
+AddModRPCHandler(modname, "PLAY_DREAM_PAN_FLUTE", function(player)
+    PlayDreamPanFlute(player)
+end)
+
+if TheInput ~= nil then
+    local function HasDreamItem()
+        local player = GLOBAL.ThePlayer
+        if player == nil or player.HUD == nil then
+            return false
+        end
+        if player.HUD:HasInputFocus() then
+            return false
+        end
+
+        local inv = player.replica ~= nil and player.replica.inventory or nil
+        if inv == nil then
+            return false
+        end
+
+        local hand_item = inv:GetEquippedItem(EQUIPSLOTS.HANDS)
+        if hand_item ~= nil and hand_item.prefab == "dream" then
+            return true
+        end
+
+        for _, item in pairs(inv:GetItems()) do
+            if item ~= nil and item.prefab == "dream" then
+                return true
+            end
+        end
+
+        return false
+    end
+
+    local function IsDreamEquipped()
+        local player = GLOBAL.ThePlayer
+        if player == nil or player.HUD == nil then
+            return false
+        end
+        if player.HUD:HasInputFocus() then
+            return false
+        end
+
+        local inv = player.replica ~= nil and player.replica.inventory or nil
+        if inv == nil then
+            return false
+        end
+
+        local hand_item = inv:GetEquippedItem(EQUIPSLOTS.HANDS)
+        return hand_item ~= nil and hand_item.prefab == "dream"
+    end
+
+    local function SendDreamStarRPC(pos)
+        if pos ~= nil then
+            SendModRPCToServer(MOD_RPC[modname]["CALL_DREAM_STAR"], pos.x, pos.z)
+        else
+            SendModRPCToServer(MOD_RPC[modname]["CALL_DREAM_STAR"])
+        end
+    end
+
+    local function SendDreamPanFluteRPC()
+        SendModRPCToServer(MOD_RPC[modname]["PLAY_DREAM_PAN_FLUTE"])
+    end
+
+    local function ShowDreamToolOptions(star_pos)
+        local front_end = GLOBAL.TheFrontEnd or TheFrontEnd
+        if front_end == nil then
+            local player = GLOBAL.ThePlayer
+            if player ~= nil and player.components ~= nil and player.components.talker ~= nil then
+                player.components.talker:Say("Dream menu unavailable")
+            end
+            return
+        end
+
+        local Screen = GLOBAL.require("widgets/screen")
+        local ImageButton = GLOBAL.require("widgets/imagebutton")
+        local Text = GLOBAL.require("widgets/text")
+        local Widget = GLOBAL.require("widgets/widget")
+
+        local screen = Screen("DreamSkillWheel")
+        local root = screen:AddChild(Widget("DreamSkillWheelRoot"))
+        local screen_width, screen_height = GLOBAL.TheSim:GetScreenSize()
+        root:SetPosition(screen_width * 0.5, screen_height * 0.5, 0)
+
+        local title = root:AddChild(Text(GLOBAL.CHATFONT, 34, "DREAM SKILLS"))
+        title:SetPosition(0, 255, 0)
+
+        local center = root:AddChild(ImageButton(
+            "images/global_redux.xml",
+            "button_carny_long_normal.tex",
+            "button_carny_long_hover.tex",
+            "button_carny_long_disabled.tex"
+        ))
+        center:SetScale(0.75, 0.75, 1)
+        center:SetPosition(0, 0, 0)
+        center:SetText("DREAM")
+        center:SetOnClick(function()
+            front_end:PopScreen()
+        end)
+
+        local function AddSkillNode(label, x, y, callback)
+            local node = root:AddChild(ImageButton(
+                "images/global_redux.xml",
+                "button_carny_long_normal.tex",
+                "button_carny_long_hover.tex",
+                "button_carny_long_disabled.tex"
+            ))
+            node:SetScale(0.85, 0.85, 1)
+            node:SetPosition(x, y, 0)
+            node:SetText(label)
+            node:SetOnClick(function()
+                front_end:PopScreen()
+                callback()
+            end)
+        end
+
+        AddSkillNode("AUTO\nPICKUP", 0, 180, function()
+            SendModRPCToServer(MOD_RPC[modname]["TOGGLE_DREAM_AUTO_PICKUP"])
+        end)
+        AddSkillNode("CALL\nSTAR", -210, 20, function()
+            SendDreamStarRPC(star_pos)
+        end)
+        AddSkillNode("PAN\nFLUTE", 210, 20, function()
+            SendDreamPanFluteRPC()
+        end)
+
+        front_end:PushScreen(screen)
+    end
+
+    TheInput:AddKeyDownHandler(KEY_G, function()
+        if HasDreamItem() then
+            SendModRPCToServer(MOD_RPC[modname]["TOGGLE_DREAM_CONTAINER"])
+        end
+    end)
+
+    TheInput:AddKeyDownHandler(KEY_T, function()
+        if IsDreamEquipped() then
+            local star_pos = nil
+            if TheInput.GetWorldPosition ~= nil then
+                star_pos = TheInput:GetWorldPosition()
+            end
+            ShowDreamToolOptions(star_pos)
+        end
+    end)
+end
+
+
+dream.lua
+============================
+local assets=
+{
+    Asset("ANIM", "anim/dream.zip"),
+    Asset("ANIM", "anim/swap_dream.zip"),
+  
+    Asset("ATLAS", "images/inventoryimages/dream.xml"),
+    Asset("IMAGE", "images/inventoryimages/dream.tex"),
+}
+
+local prefabs = 
+{
+    "impact",
+    "fire_projectile",
+    "ice_projectile",
+}
+
+local function TurnOn(inst,owner) 
+	for i=0,10 do 
+		local fx=SpawnPrefab("dream_light")
+		fx.Light:SetRadius(1.5) 
+		owner:AddChild(fx) 
+		table.insert(inst.lights, fx) 
+		fx.Transform:SetPosition(0,0,0) 
+	end 
+end 
+
+local function TurnOff(inst,owner) 
+	for k,v in ipairs(inst.lights) do 
+		v:Remove() 
+	end 
+	inst.lights={}
+end 
+
+local function light_fn()
+	local inst = CreateEntity()
+	inst.entity:AddTransform()
+	inst.entity:AddLight()
+	inst.entity:AddNetwork()
+	inst.Light:Enable(true) 
+	inst.Light:SetFalloff(.5) 
+	inst.Light:SetIntensity(.5) 
+	inst.Light:SetColour(228/255,172/255,119/255)
+	inst.persists = false
+	return inst 
+end
+
+local function OnEquip(inst, owner)
+    owner.AnimState:OverrideSymbol("swap_object", "swap_dream", "swap_dream")
+    owner.AnimState:Show("ARM_carry")
+    owner.AnimState:Hide("ARM_normal")
+    if owner.components.combat ~= nil then
+        inst._old_attack_period = owner.components.combat.min_attack_period
+
+        local attack_period = TUNING.DREAM_ATTACK_PERIOD or 0.5
+        owner.components.combat.min_attack_period = attack_period
+        if owner.components.combat.ResetCooldown ~= nil then
+            owner.components.combat:ResetCooldown()
+        end
+    end
+    TurnOn(inst,owner)
+end
+  
+local function OnUnequip(inst, owner)
+    owner.AnimState:Hide("ARM_carry")
+    owner.AnimState:Show("ARM_normal")
+    if owner._dream_auto_pickup_task ~= nil then
+        owner._dream_auto_pickup_task:Cancel()
+        owner._dream_auto_pickup_task = nil
+        owner._dream_auto_pickup_enabled = nil
+    end
+	if owner.components.combat ~= nil and inst._old_attack_period ~= nil then
+		owner.components.combat.min_attack_period = inst._old_attack_period
+		inst._old_attack_period = nil
+	end
+	TurnOff(inst,owner)
+end
+
+local function onblink(staff, pos, caster)
+    if caster then
+        if caster.components.staffsanity then
+            caster.components.staffsanity:DoCastingDelta(0)
+        elseif caster.components.sanity ~= nil then
+            caster.components.sanity:DoDelta(0)
+        end
+    end
+end
+
+local function NoHoles(pt)
+    return not TheWorld.Map:IsGroundTargetBlocked(pt)
+end
+
+local function blinkstaff_reticuletargetfn()
+    return ControllerReticle_Blink_GetPosition(ThePlayer, NoHoles)
+end
+
+local function fn()
+  
+    local inst = CreateEntity()
+ 
+    inst.entity:AddTransform()
+    inst.entity:AddAnimState()
+    inst.entity:AddNetwork()
+     
+    MakeInventoryPhysics(inst)   
+      
+    inst.AnimState:SetBank("dream")
+    inst.AnimState:SetBuild("dream")
+    inst.AnimState:PlayAnimation("idle")
+ 
+    inst:AddTag("sharp")
+    inst:AddTag("rangedweapon")
+    inst:AddTag("slingshot")
+
+    inst:AddComponent("reticule")
+    inst.components.reticule.targetfn = blinkstaff_reticuletargetfn
+    inst.components.reticule.ease = true
+
+    inst.entity:SetPristine()
+ 
+    if not TheWorld.ismastersim then
+        return inst
+    end
+
+    inst.fxcolour = {1, 145/255, 0}
+    inst.castsound = "dontstarve/common/staffteleport"
+
+    inst:AddComponent("blinkstaff")
+    inst.components.blinkstaff:SetFX("sand_puff_large_front", "sand_puff_large_back")
+    inst.components.blinkstaff.onblinkfn = onblink
+     
+    inst:AddComponent("weapon")
+    inst.components.weapon:SetDamage(TUNING.DREAM_DAMAGE)
+    inst.components.weapon:SetRange(20, 22)
+    inst.components.weapon:SetProjectile("fire_projectile")
+
+    -- Crit system
+    inst.crit_chance = TUNING.DREAM_CRIT_CHANCE or 0.25
+    inst.crit_multiplier = TUNING.DREAM_CRIT_MULTIPLIER or 1.5
+    inst.projectile_chance = TUNING.DREAM_PROJECTILE_CHANCE or 0.3
+    
+    -- Override weapon hit to add crit damage and projectiles
+    local old_onhitfn = inst.components.weapon.onhitfn
+    inst.components.weapon.onhitfn = function(weapon, attacker, target)
+        if old_onhitfn ~= nil then
+            old_onhitfn(weapon, attacker, target)
+        end
+        
+        -- Crit check
+        local is_crit = math.random() < (weapon.crit_chance or 0.25)
+        if is_crit and target ~= nil and target.components.combat ~= nil then
+            local crit_damage = weapon.components.weapon:GetDamage() * ((weapon.crit_multiplier or 1.5) - 1)
+            target.components.combat:GetAttacked(attacker, crit_damage, weapon, "none")
+        end
+        
+        -- Projectile spawn
+        if math.random() < (weapon.projectile_chance or 0.3) and attacker ~= nil and target ~= nil then
+            local projectile_type = math.random() < 0.5 and "fire_projectile" or "ice_projectile"
+            local proj = SpawnPrefab(projectile_type)
+            if proj ~= nil then
+                proj.Transform:SetPosition(attacker.Transform:GetWorldPosition())
+                local dir = target:GetPosition() - attacker:GetPosition()
+                local dist = dir:Length()
+                if dist > 0 then
+                    dir = dir:Normalize()
+                    proj.components.projectile:Launch(dir * 10, nil, attacker)
+                end
+            end
+        end
+    end
+
+    inst:AddComponent("tool")
+    inst.components.tool:SetAction(ACTIONS.CHOP, 10)
+    inst.components.tool:SetAction(ACTIONS.MINE, 10)
+    inst.components.tool:SetAction(ACTIONS.HAMMER, 2.50)
+    inst.components.tool:SetAction(ACTIONS.NET)
+    inst.components.tool:SetAction(ACTIONS.DIG)
+    -- inst.components.tool:SetAction(ACTIONS.SHAVE)
+    -- inst.components.tool:SetAction(ACTIONS.ROW)
+    -- inst.components.tool:SetAction(ACTIONS.FISH)
+    -- inst.components.tool:SetAction(ACTIONS.TILL)
+    -- inst.components.tool:SetAction(ACTIONS.POUR_WATER)
+    -- inst.components.tool:SetAction(ACTIONS.REPAIR)
+    inst.components.tool:EnableToughWork(true)
+    inst:AddComponent("oar")
+    inst.components.oar.force = 5
+    inst.components.oar.max_velocity = 20
+
+	  
+    inst:AddComponent("inspectable")
+      
+    inst:AddComponent("inventoryitem")
+	inst.components.inventoryitem.keepondeath = true
+    inst.components.inventoryitem.imagename = "dream"
+    inst.components.inventoryitem.atlasname = "images/inventoryimages/dream.xml"
+
+    inst:AddComponent("container")
+    inst.components.container:WidgetSetup("dream")
+	      
+    inst:AddComponent("equippable")
+    inst.components.equippable:SetOnEquip( OnEquip )
+    inst.components.equippable:SetOnUnequip( OnUnequip )
+	inst.components.inventoryitem.keepondeath = true
+    -- inst.components.equippable.walkspeedmult = TUNING.CANE_SPEED_MULT
+	-- inst.components.equippable.dapperness = TUNING.DAPPERNESS_SMALL
+
+    inst.lights={}
+		     
+    return inst
+end
+
+STRINGS.NAMES.DREAM = "Dream Wand"
+STRINGS.CHARACTERS.GENERIC.DESCRIBE.DREAM = "Metamorphy, what's the difference\nPress G to open container."
+STRINGS.RECIPE_DESC.DREAM = "Can't Summon Clow Cards Yet"
+
+return  Prefab("common/inventory/dream", fn, assets, prefabs), 
+	 Prefab("dream_light", light_fn, assets, prefabs)
+
+
