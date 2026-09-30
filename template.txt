@@ -9,6 +9,7 @@ local ACTIONS = GLOBAL.ACTIONS
 local EQUIPSLOTS = GLOBAL.EQUIPSLOTS
 local KEY_G = GLOBAL.KEY_G
 local KEY_T = GLOBAL.KEY_T
+local KEY_F = GLOBAL.KEY_F
 local TheInput = GLOBAL.TheInput
 local MOD_RPC = GLOBAL.MOD_RPC
 local SendModRPCToServer = GLOBAL.SendModRPCToServer
@@ -62,16 +63,6 @@ for y = 9, 0, -1 do
         table.insert(params.dream.widget.slotpos, GLOBAL.Vector3(64 * x - 32, 64 * y - 288, 0))
     end
 end
-
--- Widget hook disabled - container works fine without cosmetic customization
--- The hook was causing crashes. Container UI renders correctly with default chest appearance.
---[[
-if GLOBAL.TheNet ~= nil and not GLOBAL.TheNet:IsDedicated() and GLOBAL.AddClassPostConstruct ~= nil then
-    GLOBAL.AddClassPostConstruct("widgets/containerwidget", function(self)
-        -- ...hook code...
-    end)
-end
---]]
 
 local function FindDreamItem(player)
     if player == nil or player.components == nil or player.components.inventory == nil then
@@ -411,7 +402,126 @@ if TheInput ~= nil then
             ShowDreamToolOptions(star_pos)
         end
     end)
+
 end
+
+if GLOBAL.TheNet:GetIsServer() then
+
+    -- Tỷ lệ kích hoạt hiệu ứng (0.25 tức là 25% cơ hội xuất hiện hiệu ứng khi đánh)
+    local PROBABILITY = 0.25 
+
+    -- Hàm xử lý các hiệu ứng ngẫu nhiên
+    local function ApplyRandomAttackEffect(attacker, data)
+        -- Đảm bảo có mục tiêu và mục tiêu vẫn còn sống/hợp lệ
+        local target = data and data.target
+        if not target or not target:IsValid() then return end
+
+        -- Thử vận may: Nếu số ngẫu nhiên lớn hơn tỷ lệ đặt ra thì bỏ qua
+        if GLOBAL.math.random() > PROBABILITY then return end
+
+        -- Chọn ngẫu nhiên 1 trong 4 hiệu ứng (từ 1 đến 4)
+        local effect_type = GLOBAL.math.random(1, 4)
+
+        if effect_type == 1 then
+            -----------------------------------------------------------
+            -- ⚡ HIỆU ỨNG 1: GIẬT ĐIỆN (SÉT ĐÁNH)
+            -----------------------------------------------------------
+            local lightning = GLOBAL.SpawnPrefab("lightning")
+            if lightning then
+                lightning.Transform:SetPosition(target.Transform:GetWorldPosition())
+                -- Gây thêm sát thương điện nếu muốn (tùy chọn)
+                if target.components.combat then
+                    target.components.combat:GetAttacked(attacker, 20) -- Gây thêm 20 sát thương
+                end
+            end
+            if attacker.components.talker then
+                attacker.components.talker:Say("⚡ Giật điện!")
+            end
+
+        elseif effect_type == 2 then
+            -----------------------------------------------------------
+            -- ❄️ HIỆU ỨNG 2: ĐÓNG BĂNG MỤC TIÊU
+            -----------------------------------------------------------
+            if target.components.freezable then
+                -- Thêm độ lạnh vào mục tiêu, số càng cao đóng băng càng nhanh/lâu
+                target.components.freezable:AddColdness(2) 
+                target.components.freezable:SpawnShatterFX()
+            end
+            if attacker.components.talker then
+                attacker.components.talker:Say("❄️ Đóng băng!")
+            end
+
+        elseif effect_type == 3 then
+            -----------------------------------------------------------
+            -- 🔥 HIỆU ỨNG 3: THIÊU CHÁY
+            -----------------------------------------------------------
+            if target.components.burnable and not target.components.burnable:IsBurning() then
+                target.components.burnable:Ignite()
+            end
+            if attacker.components.talker then
+                attacker.components.talker:Say("🔥 Thiêu cháy!")
+            end
+
+        elseif effect_type == 4 then
+            -----------------------------------------------------------
+            -- 🩸 HIỆU ỨNG 4: HÚT MÁU (HỒI MÁU CHO NGƯỜI CHƠI)
+            -----------------------------------------------------------
+            if attacker.components.health and not attacker.components.health:IsDead() then
+                local heal_amount = 10 -- Số máu hồi lại cho người chơi
+                attacker.components.health:DoDelta(heal_amount)
+                
+                -- Tạo hiệu ứng hạt màu đỏ của dơi hút máu (Batilisk) để nhìn trực quan hơn
+                local fx = GLOBAL.SpawnPrefab("vampire_bat_fx")
+                if fx then
+                    fx.Transform:SetPosition(attacker.Transform:GetWorldPosition())
+                end
+            end
+            if attacker.components.talker then
+                attacker.components.talker:Say("🩸 Hút máu! (+10)")
+            end
+        end
+    end
+
+    -- Đăng ký lắng nghe sự kiện "onattackother" cho tất cả người chơi tham gia vào server
+    AddPlayerPostInit(function(inst)
+        inst:ListenForEvent("onattackother", ApplyRandomAttackEffect)
+    end)
+
+end
+
+AddStategraphPostInit("wilson", function(sg)
+    if ACTIONS == nil or ACTIONS.ATTACK == nil then
+        return
+    end
+    local attack_handler = sg.actionhandlers ~= nil and sg.actionhandlers[ACTIONS.ATTACK] or nil
+    if attack_handler == nil or attack_handler.deststate == nil then
+        return
+    end
+
+    local old_attack_handler = attack_handler.deststate
+    attack_handler.deststate = function(inst, action)
+        local weapon = inst.components.inventory:GetEquippedItem(EQUIPSLOTS.HANDS)
+        if weapon and weapon.prefab == "dream" then
+            local attack_period = TUNING.DREAM_ATTACK_PERIOD or 0.5
+            if attack_period <= 0 then
+                attack_period = 0.05
+            end
+            local mult = 0.5 / attack_period
+            inst.AnimState:SetDeltaTimeMultiplier(mult)
+			
+			inst:ListenForEvent("newstate", function(i, data)
+                if data and data.statename ~= "attack" then
+                    i.AnimState:SetDeltaTimeMultiplier(1.0)
+                end
+            end)
+			
+            return "attack"
+        else
+            inst.AnimState:SetDeltaTimeMultiplier(1.0)
+            return old_attack_handler(inst, action)
+        end
+    end
+end)
 
 
 dream.lua
