@@ -358,22 +358,56 @@ if TheInput ~= nil then
             front_end:PopScreen()
         end)
 
-        local function AddSkillNode(label, x, y, callback)
-            local node = root:AddChild(ImageButton(
-                "images/global_redux.xml",
-                "button_carny_long_normal.tex",
-                "button_carny_long_hover.tex",
-                "button_carny_long_disabled.tex"
-            ))
-            node:SetScale(0.85, 0.85, 1)
-            node:SetPosition(x, y, 0)
-            node:SetText(label)
-            node:SetOnClick(function()
-                front_end:PopScreen()
-                callback()
-            end)
-        end
+        -- local function AddSkillNode(label, x, y, callback)
+            -- local node = root:AddChild(ImageButton(
+                -- "images/global_redux.xml",
+                -- "button_carny_long_normal.tex",
+                -- "button_carny_long_hover.tex",
+                -- "button_carny_long_disabled.tex"
+            -- ))
+            -- node:SetScale(0.85, 0.85, 1)
+            -- node:SetPosition(x, y, 0)
+            -- node:SetText(label)
+            -- node:SetOnClick(function()
+                -- front_end:PopScreen()
+                -- callback()
+            -- end)
+        -- end
+		local function AddSkillNode(label, x, y, callback)
+			local node = root:AddChild(ImageButton(
+				"images/global_redux.xml",
+				"button_carny_long_normal.tex",
+				"button_carny_long_hover.tex",
+				"button_carny_long_disabled.tex"
+			))
+			
+			node:SetScale(0.23, 0.75, 1)
+			node:SetPosition(x, y, 0)
+			
+			local custom_text = node:AddChild(Text(GLOBAL.CHATFONT, 24, label))
+			
+			custom_text:SetScale(1 / 0.23, 1 / 0.75, 1) 
+			custom_text:SetPosition(0, 60, 0) 
+			custom_text:Hide() -- Ẩn chữ đi khi vừa mở menu
+			
+			local old_gain_focus = node.OnGainFocus
+			node.OnGainFocus = function(self)
+				if old_gain_focus then old_gain_focus(self) end
+				if custom_text then custom_text:Show() end
+			end
+			
+			local old_lose_focus = node.OnLoseFocus
+			node.OnLoseFocus = function(self)
+				if old_lose_focus then old_lose_focus(self) end
+				if custom_text then custom_text:Hide() end
+			end
 
+			node:SetOnClick(function()
+				front_end:PopScreen()
+				callback()
+			end)
+		end
+		
         AddSkillNode("AUTO\nPICKUP", 0, 180, function()
             SendModRPCToServer(MOD_RPC[modname]["TOGGLE_DREAM_AUTO_PICKUP"])
         end)
@@ -409,6 +443,47 @@ if GLOBAL.TheNet:GetIsServer() then
 
     -- Tỷ lệ kích hoạt hiệu ứng (0.25 tức là 25% cơ hội xuất hiện hiệu ứng khi đánh)
     local PROBABILITY = 0.25 
+	
+	local function DoChainLightning(inst, attacker, target, damage, chain_count, max_chains, hit_targets)
+        if not target or not target:IsValid() or chain_count > max_chains then
+            return
+        end
+
+        hit_targets = hit_targets or {}
+        hit_targets[target] = true
+
+        local lightning = GLOBAL.SpawnPrefab("lightning")
+        if lightning then
+            lightning.Transform:SetPosition(target.Transform:GetWorldPosition())
+            if lightning.SoundEmitter then
+                lightning.SoundEmitter:KillSound("sound") 
+            end
+        end
+
+        if target.components.health and not target.components.health:IsDead() then
+            -- Sử dụng hệ thống combat chuẩn của game để gây sát thương
+            target.components.combat:GetAttacked(attacker, damage, inst, "electric")
+        end
+
+        local x, y, z = target.Transform:GetWorldPosition()
+        local radius = 6 
+        local ents = GLOBAL.TheSim:FindEntities(x, y, z, radius, { "_combat", "_health" }, { "player", "companion", "INLIMBO", "wall" })
+
+        for _, next_target in ipairs(ents) do
+            if next_target ~= target 
+               and not hit_targets[next_target] 
+               and next_target.components.health 
+               and not next_target.components.health:IsDead() 
+               and attacker.components.combat:CanTarget(next_target) then
+                
+                -- Tạo độ trễ giữa các lần xẹt điện sang mục tiêu kế tiếp
+                attacker:DoTaskInTime(0.15, function()
+                    DoChainLightning(inst, attacker, next_target, damage, chain_count + 1, max_chains, hit_targets)
+                end)
+                break 
+            end
+        end
+    end
 
     -- Hàm xử lý các hiệu ứng ngẫu nhiên
     local function ApplyRandomAttackEffect(attacker, data)
@@ -418,6 +493,36 @@ if GLOBAL.TheNet:GetIsServer() then
 
         -- Thử vận may: Nếu số ngẫu nhiên lớn hơn tỷ lệ đặt ra thì bỏ qua
         if GLOBAL.math.random() > PROBABILITY then return end
+		
+		-- Lấy vũ khí đang cầm trên tay
+        local weapon = attacker.components.inventory and attacker.components.inventory:GetEquippedItem(GLOBAL.EQUIPSLOTS.HANDS)
+
+		-----------------------------------------------------------
+        -- 🌟 XỬ LÝ BẠO KÍCH (CRIT DAMAGE) - Chạy độc lập
+        -----------------------------------------------------------
+        local is_crit = false
+        if GLOBAL.math.random(1, 2) > 1 then
+            is_crit = true
+            
+            -- Lấy sát thương gốc của vũ khí (nếu tay không hoặc vũ khí không có sát thương thì mặc định là sát thương tay không của nhân vật)
+            local base_damage = (weapon and weapon.components.weapon and weapon.components.weapon.damage) 
+                                or (attacker.components.combat and attacker.components.combat.defaultdamage) 
+                                or 10
+                                
+            -- Tính lượng sát thương cộng thêm (ví dụ: Đánh 34 dmg -> Crit nhân 2 thành 68 dmg -> Cộng thêm 34 dmg)
+            local bonus_damage = (base_damage * GLOBAL.math.random(2, 10)) - base_damage
+            
+            if target.components.health and not target.components.health:IsDead() then
+                -- Gây thêm sát thương chí mạng lên quái
+                target.components.health:DoDelta(-bonus_damage, nil, attacker)
+                
+                -- Tạo hiệu ứng lóe sáng tại vị trí mục tiêu để báo hiệu Crit
+                local fx = GLOBAL.SpawnPrefab("impact")
+                if fx then
+                    fx.Transform:SetPosition(target.Transform:GetWorldPosition())
+                end
+            end
+        end
 
         -- Chọn ngẫu nhiên 1 trong 4 hiệu ứng (từ 1 đến 4)
         local effect_type = GLOBAL.math.random(1, 4)
@@ -426,16 +531,29 @@ if GLOBAL.TheNet:GetIsServer() then
             -----------------------------------------------------------
             -- ⚡ HIỆU ỨNG 1: GIẬT ĐIỆN (SÉT ĐÁNH)
             -----------------------------------------------------------
-            local lightning = GLOBAL.SpawnPrefab("lightning")
-            if lightning then
-                lightning.Transform:SetPosition(target.Transform:GetWorldPosition())
-                -- Gây thêm sát thương điện nếu muốn (tùy chọn)
-                if target.components.combat then
-                    target.components.combat:GetAttacked(attacker, 20) -- Gây thêm 20 sát thương
-                end
-            end
+            -- local lightning = GLOBAL.SpawnPrefab("lightning")
+            -- if lightning then
+                -- lightning.Transform:SetPosition(target.Transform:GetWorldPosition())
+                -- -- Gây thêm sát thương điện nếu muốn (tùy chọn)
+                -- if target.components.combat then
+                    -- target.components.combat:GetAttacked(attacker, 20) -- Gây thêm 20 sát thương
+                -- end
+            -- end
+            -- if attacker.components.talker then
+                -- attacker.components.talker:Say("⚡ Giật điện!")
+            -- end
+			
+			local base_chain_damage = 25 -- Sát thương mỗi tia sét giật trúng
+            local max_chains = 5         -- Số mục tiêu tối đa bị giật lan
+            
+            -- Lấy vũ khí đang cầm (nếu có) để truyền vào hàm sát thương
+            local weapon = attacker.components.inventory:GetEquippedItem(GLOBAL.EQUIPSLOTS.HANDS)
+
+            -- Kích hoạt chuỗi sét lan
+            DoChainLightning(weapon, attacker, target, base_chain_damage, 1, max_chains, {})
+
             if attacker.components.talker then
-                attacker.components.talker:Say("⚡ Giật điện!")
+                attacker.components.talker:Say("⚡ Sét chuỗi lan truyền!")
             end
 
         elseif effect_type == 2 then
@@ -455,11 +573,27 @@ if GLOBAL.TheNet:GetIsServer() then
             -----------------------------------------------------------
             -- 🔥 HIỆU ỨNG 3: THIÊU CHÁY
             -----------------------------------------------------------
-            if target.components.burnable and not target.components.burnable:IsBurning() then
-                target.components.burnable:Ignite()
+            -- if target.components.burnable and not target.components.burnable:IsBurning() then
+                -- target.components.burnable:Ignite()
+            -- end
+            -- if attacker.components.talker then
+                -- attacker.components.talker:Say("🔥 Thiêu cháy!")
+            -- end
+			
+			if attacker.components.health and not attacker.components.health:IsDead() then
+                local heal_amount = 10 -- Số máu hồi lại cho người chơi
+                attacker.components.health:DoDelta(heal_amount)
+				attacker.components.sanity:DoDelta(heal_amount)
+				attacker.components.hunger:DoDelta(heal_amount)
+                
+                -- Tạo hiệu ứng hạt màu đỏ của dơi hút máu (Batilisk) để nhìn trực quan hơn
+                local fx = GLOBAL.SpawnPrefab("vampire_bat_fx")
+                if fx then
+                    fx.Transform:SetPosition(attacker.Transform:GetWorldPosition())
+                end
             end
             if attacker.components.talker then
-                attacker.components.talker:Say("🔥 Thiêu cháy!")
+                attacker.components.talker:Say("🩸 Hút máu! (+10)")
             end
 
         elseif effect_type == 4 then
@@ -469,6 +603,8 @@ if GLOBAL.TheNet:GetIsServer() then
             if attacker.components.health and not attacker.components.health:IsDead() then
                 local heal_amount = 10 -- Số máu hồi lại cho người chơi
                 attacker.components.health:DoDelta(heal_amount)
+				attacker.components.sanity:DoDelta(heal_amount)
+				attacker.components.hunger:DoDelta(heal_amount)
                 
                 -- Tạo hiệu ứng hạt màu đỏ của dơi hút máu (Batilisk) để nhìn trực quan hơn
                 local fx = GLOBAL.SpawnPrefab("vampire_bat_fx")
